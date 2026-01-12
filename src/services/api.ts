@@ -5,9 +5,10 @@ import { generateRecommendations, generateIntroMessage } from '../utils/recommen
 import { compilePreferences, formatCompiledForPrompt, estimateTokens } from '../utils/preferenceCompiler';
 
 // Configuration
-const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
-const API_KEY = import.meta.env.VITE_CLAUDE_API_KEY || '';
-const USE_AI = import.meta.env.VITE_USE_AI === 'true' && !!API_KEY;
+// In production, AI calls go through Netlify function (API key is server-side)
+// VITE_USE_AI controls whether to attempt AI or go straight to local
+const USE_AI = import.meta.env.VITE_USE_AI === 'true';
+const API_ENDPOINT = '/.netlify/functions/recommendations';
 
 /**
  * Generate recommendations using weighted random selection based on user preferences.
@@ -35,79 +36,85 @@ function generateLocalRecommendations(preferences: FoodPreferences): Recommendat
 }
 
 /**
- * Call Claude API for AI-powered recommendations
+ * Build the prompt for Claude API
  */
-async function callClaudeAPI(preferences: FoodPreferences): Promise<RecommendationResponse> {
-  const startTime = performance.now();
-  
-  // Compile preferences to reduce token usage
+function buildPrompt(preferences: FoodPreferences): string {
   const compiled = compilePreferences(preferences);
   const compiledText = formatCompiledForPrompt(compiled);
-  const estimatedTokens = estimateTokens(compiledText);
   
-  logger.info('ai_api_call_started', {
-    endpoint: CLAUDE_API_URL,
-    rawDataSize: {
-      preferences: preferences.preferences.length,
-      restaurants: preferences.restaurants.length,
-      dislikes: preferences.dislikes.length,
-    },
-    compiledStats: compiled.stats,
-    estimatedPromptTokens: estimatedTokens,
-  });
-
-  const prompt = `You are a helpful food recommendation assistant. Based on the following food preferences, generate 10-12 diverse food suggestions. Items with "(Nx)" indicate frequency - higher frequency means stronger preference.
+  return `You are a helpful food recommendation assistant. Based on the following food preferences, generate 10-12 diverse food suggestions. Items with "(Nx)" indicate frequency - higher frequency means stronger preference.
 
 ${compiledText}
 
 Generate suggestions as JSON:
 {"recommendations":[{"name":"string","type":"restaurant"|"cuisine"|"dish","reason":"string (humorous, brief)","tags":["string"],"confidence":"high"|"medium"|"low"}],"message":"string (fun intro)"}`;
+}
 
-  const response = await fetch(CLAUDE_API_URL, {
+/**
+ * Call the serverless function for AI-powered recommendations
+ * The API key is stored securely on the server, not exposed to the browser
+ */
+async function callAIFunction(preferences: FoodPreferences): Promise<RecommendationResponse> {
+  const startTime = performance.now();
+  
+  const compiled = compilePreferences(preferences);
+  const prompt = buildPrompt(preferences);
+  const estimatedTokens_ = estimateTokens(prompt);
+  
+  logger.info('ai_api_call_started', {
+    endpoint: API_ENDPOINT,
+    compiledStats: compiled.stats,
+    estimatedPromptTokens: estimatedTokens_,
+  });
+
+  const response = await fetch(API_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': API_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
     },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2048,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-    }),
+    body: JSON.stringify({ prompt }),
   });
 
   const duration = performance.now() - startTime;
 
   if (!response.ok) {
-    const errorText = await response.text();
+    const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+    
     logger.error('ai_api_call_failed', {
-      endpoint: CLAUDE_API_URL,
+      endpoint: API_ENDPOINT,
       duration,
       status: response.status,
-      statusText: response.statusText,
-    }, new Error(`HTTP ${response.status}: ${errorText}`));
-    throw new Error(`API request failed: ${response.status} - ${response.statusText}`);
+      fallback: errorData.fallback,
+    }, new Error(errorData.error || `HTTP ${response.status}`));
+    
+    // If server indicates fallback, throw to trigger local generation
+    if (errorData.fallback) {
+      throw new Error('AI_FALLBACK');
+    }
+    
+    throw new Error(errorData.error || `API request failed: ${response.status}`);
   }
 
   const data = await response.json();
-  const content = data.content[0].text;
+  const content = data.content?.[0]?.text;
+  
+  if (!content) {
+    logger.error('ai_api_parse_failed', {
+      endpoint: API_ENDPOINT,
+      duration,
+    }, new Error('No content in response'));
+    throw new Error('AI_FALLBACK');
+  }
   
   // Parse the JSON response
   const jsonMatch = content.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
     logger.error('ai_api_parse_failed', {
-      endpoint: CLAUDE_API_URL,
+      endpoint: API_ENDPOINT,
       duration,
       rawContent: content.substring(0, 500),
     }, new Error('Failed to parse API response'));
-    throw new Error('Failed to parse API response');
+    throw new Error('AI_FALLBACK');
   }
   
   const parsed = JSON.parse(jsonMatch[0]);
@@ -119,9 +126,8 @@ Generate suggestions as JSON:
   }));
 
   logger.info('ai_api_call_completed', {
-    endpoint: CLAUDE_API_URL,
+    endpoint: API_ENDPOINT,
     duration,
-    status: response.status,
     recommendationCount: parsed.recommendations.length,
   });
 
@@ -144,24 +150,30 @@ export async function getRecommendations(preferences: FoodPreferences): Promise<
     // Try AI if enabled
     if (USE_AI) {
       try {
-        logger.info('attempting_ai_recommendations', { apiKeyPresent: !!API_KEY });
-        result = await callClaudeAPI(preferences);
+        logger.info('attempting_ai_recommendations');
+        result = await callAIFunction(preferences);
         usedAI = true;
       } catch (aiError) {
         // Log the AI failure and fall back to local
+        const errorMessage = aiError instanceof Error ? aiError.message : 'Unknown AI error';
+        
         logger.warn('ai_fallback_triggered', {
-          reason: aiError instanceof Error ? aiError.message : 'Unknown AI error',
+          reason: errorMessage,
         }, aiError instanceof Error ? aiError : undefined);
         
         // Fall back to local generation
         await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 1000));
         result = generateLocalRecommendations(preferences);
-        result.message = "AI was unavailable, but here's what we found based on her preferences:";
+        
+        // Only modify message if it wasn't a deliberate fallback
+        if (errorMessage !== 'AI_FALLBACK') {
+          result.message = "AI was unavailable, but here's what we found based on her preferences:";
+        }
       }
     } else {
       // Use local generation directly
       logger.info('using_local_recommendations', { 
-        reason: !API_KEY ? 'No API key' : 'AI disabled via VITE_USE_AI',
+        reason: 'AI disabled via VITE_USE_AI',
       });
       
       // Brief delay for UX
