@@ -1,3 +1,5 @@
+import { sendToGA } from './ga';
+
 // Log severity levels
 export const LogLevel = {
   INFO: 'info',
@@ -197,6 +199,9 @@ class Logger {
     } else if (import.meta.env.DEV) {
       console[consoleMethod](`[${level.toUpperCase()}] ${event}`, data);
     }
+
+    // Send to Google Analytics
+    sendToGA(event, data, level);
 
     this.persist();
     this.notifyListeners();
