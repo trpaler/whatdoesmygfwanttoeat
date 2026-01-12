@@ -1,0 +1,6 @@
+{
+  "preferences": ["Italian", "Thai", "Sushi", "Pasta", "Ramen"],
+  "restaurants": ["Joe's Pizza", "Pad Thai Palace", "Sushi Garden", "Olive Garden"],
+  "dislikes": ["Anything too spicy", "Seafood on Mondays", "Cilantro", "Fast food chains"],
+  "mood_tags": ["comfort food", "healthy", "adventurous", "date night"]
+}
